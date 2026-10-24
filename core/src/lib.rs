@@ -12,6 +12,8 @@ use libretifs::{AttrValue, Client, RecordView, Request, Response};
 
 pub const ME: &str = "me";
 pub const TYPE: &str = "event";
+/// A library's calendar settings (ADR-0024): it marks a calendar with no events yet.
+pub const SETTINGS_TYPE: &str = "retifs.calendar";
 
 /// An event: where it lives, its record (none until saved), its values.
 /// Keys this app doesn't edit (`uid`, an app's own) are kept.
@@ -325,6 +327,12 @@ impl Calendar {
             .filter_map(|r| r.attrs.iter().find(|(k, _)| k == "name").and_then(|(_, v)| if let AttrValue::Str(s) = v { Some(s.clone()) } else { None }))
             .collect();
         names.retain(|n| !shares.contains(n));
+        // A library is a calendar if it holds events, or says it is one
+        // (a new, empty calendar). Libraries of other kinds (photos, an
+        // address book) are left to the apps for them.
+        names.retain(|n| {
+            !self.query(&mut c, n, vec![format!("type={TYPE}")]).is_empty() || !self.query(&mut c, n, vec![format!("type={SETTINGS_TYPE}")]).is_empty()
+        });
         names.sort_by_key(|n| n.to_lowercase());
         names.insert(0, ME.into());
         Ok(names)
