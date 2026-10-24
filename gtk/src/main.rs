@@ -81,6 +81,9 @@ fn build(gapp: &adw::Application) {
     header.set_title_widget(Some(&title));
     header.pack_start(&today);
     header.pack_end(&add);
+    let share = gtk::Button::from_icon_name("emblem-shared-symbolic");
+    share.set_tooltip_text(Some("Share a calendar"));
+    header.pack_end(&share);
     let page = adw::PreferencesPage::new();
     let day = adw::PreferencesGroup::new();
     let coming = adw::PreferencesGroup::builder().title("Coming up").description("The next two weeks").build();
@@ -132,6 +135,10 @@ fn build(gapp: &adw::Application) {
             select(&me.month, Local::now().date_naive());
             reload(&me);
         });
+    }
+    {
+        let me = me.clone();
+        share.connect_clicked(move |_| share_calendar_dialog(&me));
     }
     {
         let me = me.clone();
@@ -353,9 +360,18 @@ fn edit_event(me: &Rc<App>, e: Event, new: bool) {
     save.add_css_class("suggested-action");
     let delete = gtk::Button::from_icon_name("user-trash-symbolic");
     delete.set_visible(!new);
+    let share = gtk::Button::builder().label("Share…").visible(!new).tooltip_text("A link to this event alone: whoever opens it sees it, and sees it change").build();
     let header = adw::HeaderBar::new();
     header.pack_end(&save);
     header.pack_start(&delete);
+    header.pack_start(&share);
+    {
+        let (me2, e2) = (me.clone(), e.clone());
+        share.connect_clicked(move |_| {
+            let (me3, e3) = (me2.clone(), e2.clone());
+            bg(&me2.cal, move |c| c.share_event(&e3), move |r| show_link(&me3, "Share this event", "Whoever opens this link sees this event, and sees it when it changes. Nothing else of the calendar.", r));
+        });
+    }
     let view = adw::ToolbarView::new();
     view.add_top_bar(&header);
     view.set_content(Some(&page));
@@ -416,6 +432,61 @@ fn edit_event(me: &Rc<App>, e: Event, new: bool) {
             });
         });
     }
+    dialog.present();
+}
+
+/// Sharing a calendar: with a colleague who writes to it too, or for reading,
+/// all of it or only when it's busy.
+fn share_calendar_dialog(me: &Rc<App>) {
+    let libs: Vec<String> = me.libraries.borrow().iter().filter(|l| *l != ME).cloned().collect();
+    if libs.is_empty() {
+        show_link(me, "Share a calendar", "", Err("Your own calendar (me) is yours alone. Make a calendar to share first.".into()));
+        return;
+    }
+    let pick = gtk::DropDown::from_strings(&libs.iter().map(String::as_str).collect::<Vec<_>>());
+    let dialog = adw::MessageDialog::builder()
+        .heading("Share a calendar")
+        .body("A member reads and writes it (a colleague). A reader sees all of it. Free/busy shows only when it's busy: no titles, places, notes or people.")
+        .extra_child(&pick)
+        .transient_for(&me.window)
+        .close_response("cancel")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("busy", "Free/busy"), ("read", "Reader"), ("member", "Member")]);
+    dialog.set_response_appearance("member", adw::ResponseAppearance::Suggested);
+    let me2 = me.clone();
+    dialog.connect_response(None, move |_, r| {
+        let Some(ns) = libs.get(pick.selected() as usize).cloned() else { return };
+        let me3 = me2.clone();
+        match r {
+            "member" => bg(&me2.cal, move |c| c.invite_link(&ns), move |l| show_link(&me3, "Invite a member", "Whoever opens this invitation first joins the calendar and may write to it. It works once, for a week.", l)),
+            "read" => bg(&me2.cal, move |c| c.share_calendar(&ns, false), move |l| show_link(&me3, "Share for reading", "Whoever has this link reads the whole calendar.", l)),
+            "busy" => bg(&me2.cal, move |c| c.share_calendar(&ns, true), move |l| show_link(&me3, "Share free/busy", "Whoever has this link sees when the calendar is busy, and nothing else.", l)),
+            _ => {}
+        }
+    });
+    dialog.present();
+}
+
+/// A link to give someone, to copy.
+fn show_link(me: &Rc<App>, heading: &str, body: &str, link: Result<String, String>) {
+    let (body, link) = match link {
+        Ok(l) => (body.to_string(), Some(l)),
+        Err(e) => (e, None),
+    };
+    let dialog = adw::MessageDialog::builder().heading(heading).body(body).transient_for(&me.window).close_response("close").build();
+    if let Some(link) = &link {
+        let label = gtk::Label::builder().label(link).selectable(true).wrap(true).wrap_mode(gtk::pango::WrapMode::Char).css_classes(["monospace", "caption"]).build();
+        dialog.set_extra_child(Some(&label));
+        dialog.add_response("copy", "Copy link");
+    }
+    dialog.add_response("close", "Close");
+    dialog.connect_response(None, move |d, r| {
+        if r == "copy" {
+            if let Some(l) = &link {
+                d.clipboard().set_text(l);
+            }
+        }
+    });
     dialog.present();
 }
 

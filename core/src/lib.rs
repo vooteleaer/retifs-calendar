@@ -114,7 +114,8 @@ impl Event {
 
     pub fn title(&self) -> String {
         let t = self.get("title");
-        if t.is_empty() { "Untitled".into() } else { t.into() }
+        // Without a title: one of a free/busy share, or one not named yet.
+        if t.is_empty() { "Busy".into() } else { t.into() }
     }
 
     pub fn start(&self) -> Option<When> {
@@ -316,6 +317,14 @@ impl Calendar {
             _ => Vec::new(),
         };
         names.retain(|n| n != ME && !n.starts_with("ch-"));
+        // Shares this node keeps for others (a calendar's free/busy view, one
+        // shared event) aren't calendars of its own: their source is.
+        let shares: Vec<String> = names
+            .iter()
+            .flat_map(|ns| self.query(&mut c, ns, vec!["type=retifs.share".into()]))
+            .filter_map(|r| r.attrs.iter().find(|(k, _)| k == "name").and_then(|(_, v)| if let AttrValue::Str(s) = v { Some(s.clone()) } else { None }))
+            .collect();
+        names.retain(|n| !shares.contains(n));
         names.sort_by_key(|n| n.to_lowercase());
         names.insert(0, ME.into());
         Ok(names)
@@ -400,6 +409,67 @@ impl Calendar {
         let Some(id) = &e.id else { return Ok(()) };
         let mut c = self.client()?;
         self.call(&mut c, Request::RecordDelete { ns: e.ns.clone(), id: id.clone() }).map(|_| ())
+    }
+
+    /// A `retifs:` link to read namespace `ns` (a calendar, or a share made from one).
+    fn read_link(&self, c: &mut Client, ns: &str, label: &str) -> Result<String, String> {
+        let address = match self.call(c, Request::NsAddress { ns: ns.into() })? {
+            Response::Channel { address } => address,
+            other => return Err(format!("unexpected answer: {other:?}")),
+        };
+        let (node, _, _) = self.rt.block_on(c.ping()).map_err(|e| e.to_string())?;
+        // `view=calendar` (ADR-0020): whatever opens the link joins the
+        // library and opens it in a calendar.
+        let mut link = libretifs::link::Link::namespace(&address, &[node], Some(label));
+        link.params.push(("view".into(), "calendar".into()));
+        Ok(link.to_string())
+    }
+
+    /// An invitation to calendar `ns` (ADR-0020): whoever opens it first may
+    /// read and write it, as a member (a colleague joining the work calendar).
+    pub fn invite_link(&self, ns: &str) -> Result<String, String> {
+        let mut c = self.client()?;
+        let req = Request::InviteCreate { ns: ns.into(), grant: false, keys: vec![], until: None, expires_ms: Some(7 * 86_400_000), q: None, label: Some(ns.into()) };
+        match self.call(&mut c, req)? {
+            Response::Link { link } => Ok(link),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
+    /// A link to read calendar `ns`: all of it, or with `free_busy` only when
+    /// its events are (a share without titles, places, notes or attendees,
+    /// ADR-0021: a partner finding a time).
+    pub fn share_calendar(&self, ns: &str, free_busy: bool) -> Result<String, String> {
+        let mut c = self.client()?;
+        if !free_busy {
+            return self.read_link(&mut c, ns, ns);
+        }
+        let name = format!("{ns}-busy");
+        let omit = ["title", "note", "location", "attendee:*", "uid"].map(String::from).to_vec();
+        let req = Request::ShareCreate { source: ns.into(), name: name.clone(), terms: vec![format!("type={TYPE}")], ids: vec![], omit };
+        match self.call(&mut c, req) {
+            Ok(_) => {}
+            // Made before: its link again.
+            Err(e) if e.contains("already exists") => {}
+            Err(e) => return Err(e),
+        }
+        self.read_link(&mut c, &name, &format!("{ns} (free/busy)"))
+    }
+
+    /// A link to read one event (a share of just it, kept up to date: a
+    /// client sees the meeting move when it moves).
+    pub fn share_event(&self, e: &Event) -> Result<String, String> {
+        let id = e.id.clone().ok_or("save the event first")?;
+        let mut c = self.client()?;
+        let slug: String = e.title().to_lowercase().chars().map(|ch| if ch.is_alphanumeric() { ch } else { '-' }).collect::<String>().split('-').filter(|s| !s.is_empty()).take(4).collect::<Vec<_>>().join("-");
+        let name = format!("{}-{}-{}", e.ns, if slug.is_empty() { "event" } else { &slug }, &id[..6]);
+        let req = Request::ShareCreate { source: e.ns.clone(), name: name.clone(), terms: vec![], ids: vec![id], omit: vec![] };
+        match self.call(&mut c, req) {
+            Ok(_) => {}
+            Err(err) if err.contains("already exists") => {}
+            Err(err) => return Err(err),
+        }
+        self.read_link(&mut c, &name, &e.title())
     }
 
     /// Each library's change count: a front end reloads when these differ.
