@@ -11,7 +11,8 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use libretifs::{AttrValue, Client, RecordView, Request, Response};
 
 pub const ME: &str = "me";
-pub const TYPE: &str = "event";
+/// What an event is (ADR-0025): the iCalendar media type.
+pub const TYPE: &str = libretifs::types::EVENT;
 /// A library's calendar settings (ADR-0024): it marks a calendar with no events yet.
 pub const SETTINGS_TYPE: &str = "retifs.calendar";
 
@@ -331,7 +332,7 @@ impl Calendar {
         // (a new, empty calendar). Libraries of other kinds (photos, an
         // address book) are left to the apps for them.
         names.retain(|n| {
-            !self.query(&mut c, n, vec![format!("type={TYPE}")]).is_empty() || !self.query(&mut c, n, vec![format!("type={SETTINGS_TYPE}")]).is_empty()
+            libretifs::types::terms(TYPE).into_iter().any(|t| !self.query(&mut c, n, vec![t]).is_empty()) || !self.query(&mut c, n, vec![format!("type={SETTINGS_TYPE}")]).is_empty()
         });
         names.sort_by_key(|n| n.to_lowercase());
         names.insert(0, ME.into());
@@ -343,7 +344,8 @@ impl Calendar {
         let mut c = self.client()?;
         let mut out = Vec::new();
         for ns in libraries {
-            for r in self.query(&mut c, ns, vec![format!("type={TYPE}")]) {
+            let records: Vec<RecordView> = libretifs::types::terms(TYPE).into_iter().flat_map(|t| self.query(&mut c, ns, vec![t])).collect();
+            for r in records {
                 let e = Event::from_record(ns, &r);
                 let (Some(s), Some(en)) = (e.start(), e.end()) else { continue };
                 let length = |w: When| match (s, en, w) {
@@ -372,7 +374,10 @@ impl Calendar {
     }
 
     fn people_in(&self, c: &mut Client, ns: &str) -> Vec<Person> {
-        self.query(c, ns, vec!["type=contact".into()])
+        libretifs::types::terms(libretifs::types::PERSON)
+            .into_iter()
+            .flat_map(|t| self.query(c, ns, vec![t]))
+            .collect::<Vec<_>>()
             .iter()
             .map(|r| {
                 let get = |k: &str| r.attrs.iter().find(|(key, _)| key == k).and_then(|(_, v)| if let AttrValue::Str(s) = v { Some(s.clone()) } else { None }).unwrap_or_default();
