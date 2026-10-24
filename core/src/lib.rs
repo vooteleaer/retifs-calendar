@@ -1,0 +1,479 @@
+//! Calendars on retifs: the `type=event` records of ADR-0024 in any library
+//! (each library holding events is a calendar: the user's own, a club's
+//! family calendar), repeating events by their RFC 5545 rule, and the
+//! birthdays of the contacts the user can see, shown as yearly events
+//! without being copied. Attendees are contacts (`attendee:<contact id>`).
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use libretifs::{AttrValue, Client, RecordView, Request, Response};
+
+pub const ME: &str = "me";
+pub const TYPE: &str = "event";
+
+/// An event: where it lives, its record (none until saved), its values.
+/// Keys this app doesn't edit (`uid`, an app's own) are kept.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Event {
+    pub ns: String,
+    pub id: Option<String>,
+    pub values: BTreeMap<String, String>,
+}
+
+/// When an event is: all day (a date) or at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum When {
+    Day(NaiveDate),
+    At(NaiveDateTime),
+}
+
+impl When {
+    pub fn parse(s: &str) -> Option<When> {
+        let s = s.trim();
+        if let Ok(t) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
+            return Some(When::At(t));
+        }
+        if let Ok(t) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+            return Some(When::At(t));
+        }
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().map(When::Day)
+    }
+
+    pub fn date(self) -> NaiveDate {
+        match self {
+            When::Day(d) => d,
+            When::At(t) => t.date(),
+        }
+    }
+
+    /// For ordering: by day, all-day ones first, then by time.
+    pub fn sort_key(self) -> (NaiveDate, Option<NaiveTime>) {
+        match self {
+            When::Day(d) => (d, None),
+            When::At(t) => (t.date(), Some(t.time())),
+        }
+    }
+
+    pub fn format(self) -> String {
+        match self {
+            When::Day(d) => d.format("%Y-%m-%d").to_string(),
+            When::At(t) => t.format("%Y-%m-%dT%H:%M").to_string(),
+        }
+    }
+
+    fn shift(self, days: i64, months: i32) -> Option<When> {
+        let move_date = |d: NaiveDate| -> Option<NaiveDate> {
+            let d = if months != 0 { add_months(d, months)? } else { d };
+            d.checked_add_signed(Duration::days(days))
+        };
+        Some(match self {
+            When::Day(d) => When::Day(move_date(d)?),
+            When::At(t) => When::At(NaiveDateTime::new(move_date(t.date())?, t.time())),
+        })
+    }
+}
+
+/// `d` plus `n` months; None if that day doesn't exist (31 January plus a
+/// month), which RFC 5545 skips.
+fn add_months(d: NaiveDate, n: i32) -> Option<NaiveDate> {
+    let total = d.year() * 12 + d.month0() as i32 + n;
+    NaiveDate::from_ymd_opt(total.div_euclid(12), total.rem_euclid(12) as u32 + 1, d.day())
+}
+
+impl Event {
+    pub fn new(ns: &str) -> Event {
+        Event { ns: ns.into(), ..Default::default() }
+    }
+
+    fn from_record(ns: &str, r: &RecordView) -> Event {
+        let values = r
+            .attrs
+            .iter()
+            .filter_map(|(k, v)| match v {
+                AttrValue::Str(s) => Some((k.clone(), s.clone())),
+                _ => None,
+            })
+            .collect();
+        Event { ns: ns.into(), id: Some(r.id.clone()), values }
+    }
+
+    pub fn get(&self, key: &str) -> &str {
+        self.values.get(key).map(String::as_str).unwrap_or("")
+    }
+
+    pub fn set(&mut self, key: &str, value: &str) {
+        let value = value.trim();
+        if value.is_empty() {
+            self.values.remove(key);
+        } else {
+            self.values.insert(key.into(), value.into());
+        }
+    }
+
+    pub fn title(&self) -> String {
+        let t = self.get("title");
+        if t.is_empty() { "Untitled".into() } else { t.into() }
+    }
+
+    pub fn start(&self) -> Option<When> {
+        When::parse(self.get("start"))
+    }
+
+    /// Its end: as written, else an hour after a timed start, else the next
+    /// day after an all-day one (exclusive, as iCalendar).
+    pub fn end(&self) -> Option<When> {
+        When::parse(self.get("end")).or_else(|| match self.start()? {
+            When::Day(d) => Some(When::Day(d.succ_opt()?)),
+            When::At(t) => Some(When::At(t + Duration::hours(1))),
+        })
+    }
+
+    /// The contacts it names as attendees: (contact id, name hint).
+    pub fn attendees(&self) -> Vec<(String, String)> {
+        self.values.iter().filter_map(|(k, v)| k.strip_prefix("attendee:").map(|id| (id.to_string(), v.clone()))).collect()
+    }
+
+    pub fn set_attendees(&mut self, people: &[(String, String)]) {
+        self.values.retain(|k, _| !k.starts_with("attendee:"));
+        for (id, name) in people {
+            self.values.insert(format!("attendee:{id}"), name.clone());
+        }
+    }
+
+    /// Its start in every repetition (or once) that falls in `from..to`
+    /// (one that began earlier but still runs counts). Dates a rule makes
+    /// that don't exist (31 February) are skipped and not counted, as RFC
+    /// 5545 says.
+    pub fn starts_between(&self, from: NaiveDate, to: NaiveDate) -> Vec<When> {
+        let Some(start) = self.start() else { return Vec::new() };
+        let rule = Rule::parse(self.get("rrule"));
+        let days = self.end().map_or(1, |e| (e.date() - start.date()).num_days().max(1));
+        let step = rule.interval as i64;
+        let mut out = Vec::new();
+        let mut made = 0u32;
+        for i in 0..100_000i64 {
+            let t = match rule.freq {
+                None if i > 0 => break,
+                None => Some(start),
+                Some(Freq::Daily) => start.shift(i * step, 0),
+                Some(Freq::Weekly) => start.shift(7 * i * step, 0),
+                Some(Freq::Monthly) => start.shift(0, (i * step) as i32),
+                Some(Freq::Yearly) => start.shift(0, (12 * i * step) as i32),
+            };
+            let Some(t) = t else { continue };
+            if t.date() >= to || rule.count.is_some_and(|c| made >= c) || rule.until.is_some_and(|u| t.date() > u) {
+                break;
+            }
+            made += 1;
+            if t.date() + Duration::days(days - 1) >= from {
+                out.push(t);
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freq {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+/// The parts of an RFC 5545 rule this calendar follows: FREQ, INTERVAL,
+/// COUNT, UNTIL. Others (BYDAY lists, …) are kept in the record and shown
+/// as the plain frequency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rule {
+    pub freq: Option<Freq>,
+    pub interval: u32,
+    pub count: Option<u32>,
+    pub until: Option<NaiveDate>,
+}
+
+impl Rule {
+    pub fn parse(s: &str) -> Rule {
+        let mut r = Rule { freq: None, interval: 1, count: None, until: None };
+        for part in s.split(';') {
+            let Some((k, v)) = part.split_once('=') else { continue };
+            match k.trim().to_ascii_uppercase().as_str() {
+                "FREQ" => {
+                    r.freq = match v.trim().to_ascii_uppercase().as_str() {
+                        "DAILY" => Some(Freq::Daily),
+                        "WEEKLY" => Some(Freq::Weekly),
+                        "MONTHLY" => Some(Freq::Monthly),
+                        "YEARLY" => Some(Freq::Yearly),
+                        _ => None,
+                    }
+                }
+                "INTERVAL" => r.interval = v.trim().parse().unwrap_or(1).max(1),
+                "COUNT" => r.count = v.trim().parse().ok(),
+                "UNTIL" => r.until = NaiveDate::parse_from_str(&v.trim()[..8.min(v.trim().len())], "%Y%m%d").ok(),
+                _ => {}
+            }
+        }
+        r
+    }
+}
+
+/// One showing of an event (or a birthday) on the calendar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Occurrence {
+    pub event: Event,
+    pub start: When,
+    pub end: When,
+    /// A contact's birthday, not an event record: (contact id, age that day if the year is known).
+    pub birthday: Option<(String, Option<i32>)>,
+}
+
+impl Occurrence {
+    pub fn title(&self) -> String {
+        match &self.birthday {
+            Some((_, Some(age))) => format!("{}'s birthday ({age})", self.event.title()),
+            Some((_, None)) => format!("{}'s birthday", self.event.title()),
+            None => self.event.title(),
+        }
+    }
+
+    /// Its time for a list: "All day" or "15:00–18:00".
+    pub fn time_text(&self) -> String {
+        match (self.start, self.end) {
+            (When::At(a), When::At(b)) if a.date() == b.date() => format!("{}–{}", a.format("%H:%M"), b.format("%H:%M")),
+            (When::At(a), When::At(b)) => format!("{} – {}", a.format("%H:%M"), b.format("%d.%m %H:%M")),
+            (When::At(a), _) => a.format("%H:%M").to_string(),
+            _ => "All day".into(),
+        }
+    }
+}
+
+/// A contact the calendar knows: for attendees and birthdays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Person {
+    pub ns: String,
+    pub id: String,
+    pub name: String,
+    /// `YYYY-MM-DD` or `--MM-DD`.
+    pub birthday: String,
+}
+
+impl Person {
+    /// The birthday in year `y`: (date, age if the birth year is known).
+    pub fn birthday_in(&self, y: i32) -> Option<(NaiveDate, Option<i32>)> {
+        let b = self.birthday.trim();
+        let (year, md) = if let Some(md) = b.strip_prefix("--") { (None, md) } else { (b.get(..4)?.parse::<i32>().ok(), b.get(5..)?) };
+        let (m, d) = md.split_once('-')?;
+        let (m, d) = (m.parse().ok()?, d.parse().ok()?);
+        // 29 February in a year without it: the 28th.
+        let date = NaiveDate::from_ymd_opt(y, m, d).or_else(|| NaiveDate::from_ymd_opt(y, m, d - 1))?;
+        Some((date, year.map(|by| y - by)))
+    }
+}
+
+/// The connection to `retifsd`.
+pub struct Calendar {
+    rt: tokio::runtime::Runtime,
+    store: PathBuf,
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Calendar {
+    pub fn new() -> Self {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
+        Calendar { rt, store: libretifs::default_store_dir() }
+    }
+
+    fn client(&self) -> Result<Client, String> {
+        self.rt.block_on(Client::connect(&self.store)).map_err(|e| e.to_string())
+    }
+
+    fn call(&self, c: &mut Client, req: Request) -> Result<Response, String> {
+        match self.rt.block_on(c.call(req)).map_err(|e| e.to_string())? {
+            Response::Error { message } => Err(message),
+            r => Ok(r),
+        }
+    }
+
+    fn query(&self, c: &mut Client, ns: &str, terms: Vec<String>) -> Vec<RecordView> {
+        match self.call(c, Request::Query { ns: ns.into(), terms, at: None }) {
+            Ok(Response::Records { records }) => records,
+            _ => Vec::new(),
+        }
+    }
+
+    /// The libraries this device has: `me` first, then by name.
+    pub fn libraries(&self) -> Result<Vec<String>, String> {
+        let mut c = self.client()?;
+        let mut names = match self.call(&mut c, Request::Namespaces)? {
+            Response::Names { names } => names,
+            _ => Vec::new(),
+        };
+        names.retain(|n| n != ME && !n.starts_with("ch-"));
+        names.sort_by_key(|n| n.to_lowercase());
+        names.insert(0, ME.into());
+        Ok(names)
+    }
+
+    /// The events and birthdays in `libraries` from `from` until `to` (exclusive), by start.
+    pub fn occurrences(&self, libraries: &[String], from: NaiveDate, to: NaiveDate, birthdays: bool) -> Result<Vec<Occurrence>, String> {
+        let mut c = self.client()?;
+        let mut out = Vec::new();
+        for ns in libraries {
+            for r in self.query(&mut c, ns, vec![format!("type={TYPE}")]) {
+                let e = Event::from_record(ns, &r);
+                let (Some(s), Some(en)) = (e.start(), e.end()) else { continue };
+                let length = |w: When| match (s, en, w) {
+                    (When::At(a), When::At(b), When::At(t)) => When::At(t + (b - a)),
+                    (_, _, w) => w.shift((en.date() - s.date()).num_days(), 0).unwrap_or(w),
+                };
+                for start in e.starts_between(from, to) {
+                    out.push(Occurrence { event: e.clone(), start, end: length(start), birthday: None });
+                }
+            }
+            if birthdays {
+                for p in self.people_in(&mut c, ns).into_iter().filter(|p| !p.birthday.is_empty()) {
+                    for y in from.year()..=to.year() {
+                        let Some((d, age)) = p.birthday_in(y) else { continue };
+                        if d >= from && d < to {
+                            let mut e = Event::new(ns);
+                            e.set("title", &p.name);
+                            out.push(Occurrence { event: e, start: When::Day(d), end: When::Day(d + Duration::days(1)), birthday: Some((p.id.clone(), age)) });
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.start.sort_key().cmp(&b.start.sort_key()).then(a.title().cmp(&b.title())));
+        Ok(out)
+    }
+
+    fn people_in(&self, c: &mut Client, ns: &str) -> Vec<Person> {
+        self.query(c, ns, vec!["type=contact".into()])
+            .iter()
+            .map(|r| {
+                let get = |k: &str| r.attrs.iter().find(|(key, _)| key == k).and_then(|(_, v)| if let AttrValue::Str(s) = v { Some(s.clone()) } else { None }).unwrap_or_default();
+                let full = [get("given"), get("family")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+                let name = [get("name"), full, get("email")].into_iter().find(|s| !s.is_empty()).unwrap_or_else(|| "No name".into());
+                Person { ns: ns.into(), id: r.id.clone(), name, birthday: get("birthday") }
+            })
+            .collect()
+    }
+
+    /// The contacts in `libraries` (for attendees), by name.
+    pub fn people(&self, libraries: &[String]) -> Vec<Person> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        let mut out: Vec<Person> = libraries.iter().flat_map(|ns| self.people_in(&mut c, ns)).collect();
+        out.sort_by_key(|p| p.name.to_lowercase());
+        out
+    }
+
+    /// Saves an event: a new record, or what changed (keys it no longer has are unset).
+    pub fn save(&self, e: &Event, before: Option<&Event>) -> Result<Event, String> {
+        let mut c = self.client()?;
+        let attrs: Vec<(String, AttrValue)> =
+            e.values.iter().filter(|(k, v)| before.is_none_or(|b| b.values.get(*k) != Some(*v))).map(|(k, v)| (k.clone(), AttrValue::Str(v.clone()))).collect();
+        let req = match &e.id {
+            Some(id) => {
+                let unset = before.map(|b| b.values.keys().filter(|k| !e.values.contains_key(*k)).cloned().collect()).unwrap_or_default();
+                Request::RecordSet { ns: e.ns.clone(), id: id.clone(), attrs, unset, data: None }
+            }
+            None => {
+                let mut attrs = attrs;
+                attrs.push(("type".into(), AttrValue::Str(TYPE.into())));
+                Request::RecordCreate { ns: e.ns.clone(), attrs, data: None }
+            }
+        };
+        match self.call(&mut c, req)? {
+            Response::Records { records } => records.first().map(|r| Event::from_record(&e.ns, r)).ok_or_else(|| "nothing saved".into()),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
+    pub fn delete(&self, e: &Event) -> Result<(), String> {
+        let Some(id) = &e.id else { return Ok(()) };
+        let mut c = self.client()?;
+        self.call(&mut c, Request::RecordDelete { ns: e.ns.clone(), id: id.clone() }).map(|_| ())
+    }
+
+    /// Each library's change count: a front end reloads when these differ.
+    pub fn change_counts(&self, libraries: &[String]) -> HashMap<String, u64> {
+        let Ok(mut c) = self.client() else { return HashMap::new() };
+        libraries
+            .iter()
+            .filter_map(|ns| match self.rt.block_on(c.call(Request::Watch { ns: ns.clone(), since: 0, timeout_ms: 0 })) {
+                Ok(Response::Changed { count }) => Some((ns.clone(), count)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// `date` at `hh:mm`.
+pub fn at(date: NaiveDate, hh: u32, mm: u32) -> When {
+    When::At(NaiveDateTime::new(date, NaiveTime::from_hms_opt(hh, mm, 0).unwrap_or_default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn ev(start: &str, rrule: &str) -> Event {
+        let mut e = Event::new(ME);
+        e.set("start", start);
+        e.set("rrule", rrule);
+        e
+    }
+
+    #[test]
+    fn once_and_spans() {
+        let e = ev("2026-10-24T15:00", "");
+        assert_eq!(e.starts_between(d(2026, 10, 1), d(2026, 11, 1)), [When::parse("2026-10-24T15:00").unwrap()]);
+        assert!(e.starts_between(d(2026, 10, 25), d(2026, 11, 1)).is_empty());
+        assert_eq!(e.end(), When::parse("2026-10-24T16:00"));
+        let mut trip = ev("2026-10-20", "");
+        trip.set("end", "2026-10-27");
+        assert_eq!(trip.starts_between(d(2026, 10, 24), d(2026, 10, 25)).len(), 1, "still running on the 24th");
+    }
+
+    #[test]
+    fn repeating() {
+        let weekly = ev("2026-10-05T18:00", "FREQ=WEEKLY");
+        assert_eq!(weekly.starts_between(d(2026, 10, 1), d(2026, 11, 1)).len(), 4);
+        let fortnight = ev("2026-10-05", "FREQ=WEEKLY;INTERVAL=2;COUNT=3");
+        assert_eq!(fortnight.starts_between(d(2026, 1, 1), d(2027, 1, 1)).iter().map(|w| w.format()).collect::<Vec<_>>(), ["2026-10-05", "2026-10-19", "2026-11-02"]);
+        let monthly31 = ev("2026-01-31", "FREQ=MONTHLY");
+        let got: Vec<String> = monthly31.starts_between(d(2026, 1, 1), d(2026, 6, 1)).iter().map(|w| w.format()).collect();
+        assert_eq!(got, ["2026-01-31", "2026-03-31", "2026-05-31"], "months without a 31st are skipped");
+        let yearly = ev("2024-02-29", "FREQ=YEARLY;UNTIL=20330101");
+        assert_eq!(yearly.starts_between(d(2024, 1, 1), d(2040, 1, 1)).len(), 3, "2024, 2028, 2032");
+        let daily = ev("2026-10-30", "FREQ=DAILY");
+        assert_eq!(daily.starts_between(d(2026, 10, 1), d(2026, 11, 3)).len(), 4);
+    }
+
+    #[test]
+    fn birthdays_and_attendees() {
+        let p = Person { ns: ME.into(), id: "a".into(), name: "Ema".into(), birthday: "1961-03-14".into() };
+        assert_eq!(p.birthday_in(2027), Some((d(2027, 3, 14), Some(66))));
+        let leap = Person { birthday: "--02-29".into(), ..p.clone() };
+        assert_eq!(leap.birthday_in(2027), Some((d(2027, 2, 28), None)));
+        let mut e = Event::new(ME);
+        e.set_attendees(&[("abc".into(), "Ema".into())]);
+        assert_eq!(e.attendees(), [("abc".to_string(), "Ema".to_string())]);
+        e.set_attendees(&[]);
+        assert!(e.attendees().is_empty());
+        let mut list = [When::parse("2026-10-25T17:00").unwrap(), When::parse("2026-10-28").unwrap(), When::parse("2026-10-25").unwrap()];
+        list.sort_by_key(|w| w.sort_key());
+        assert_eq!(list.map(|w| w.format()), ["2026-10-25", "2026-10-25T17:00", "2026-10-28"]);
+    }
+}

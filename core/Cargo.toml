@@ -1,0 +1,12 @@
+[package]
+name = "retifs-calendar-core"
+description = "Calendars on retifs: the type=event records of ADR-0024, and contacts' birthdays, through libretifs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libretifs = { path = "../../retifs/crates/libretifs" }
+tokio = { version = "1", features = ["rt"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

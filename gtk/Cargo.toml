@@ -1,0 +1,17 @@
+[package]
+name = "retifs-calendar-gtk"
+description = "retifs Calendar for Linux: a GTK 4 / libadwaita front end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "retifs-calendar"
+path = "src/main.rs"
+
+[dependencies]
+retifs-calendar-core = { path = "../core" }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
