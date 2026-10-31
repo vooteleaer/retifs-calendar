@@ -12,7 +12,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gtk::{gio, glib};
-use retifs_calendar_core::{Calendar, Event, Occurrence, Person, When, ME};
+use retifs_calendar_core::{Calendar, Event, Form, Occurrence, Person, When, ME, REPEATS};
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id("org.retifs.Calendar").build();
@@ -28,8 +28,6 @@ fn bg<T: Send + 'static>(cal: &Arc<Calendar>, work: impl FnOnce(&Calendar) -> T 
         }
     });
 }
-
-const REPEATS: [(&str, &str); 5] = [("Never", ""), ("Every day", "FREQ=DAILY"), ("Every week", "FREQ=WEEKLY"), ("Every month", "FREQ=MONTHLY"), ("Every year", "FREQ=YEARLY")];
 
 struct App {
     cal: Arc<Calendar>,
@@ -316,14 +314,7 @@ fn edit_event(me: &Rc<App>, e: Event, new: bool) {
         });
     }
     let repeat = adw::ComboRow::builder().title("Repeats").model(&gtk::StringList::new(&REPEATS.iter().map(|(n, _)| *n).collect::<Vec<_>>())).build();
-    let freq = retifs_calendar_core::Rule::parse(e.get("rrule")).freq;
-    repeat.set_selected(match freq {
-        None => 0,
-        Some(retifs_calendar_core::Freq::Daily) => 1,
-        Some(retifs_calendar_core::Freq::Weekly) => 2,
-        Some(retifs_calendar_core::Freq::Monthly) => 3,
-        Some(retifs_calendar_core::Freq::Yearly) => 4,
-    });
+    repeat.set_selected(e.repeat_index() as u32);
     when.add(&date);
     when.add(&whole);
     when.add(&from);
@@ -385,27 +376,18 @@ fn edit_event(me: &Rc<App>, e: Event, new: bool) {
             if new {
                 ev.ns = libs_at(&me2, library.selected());
             }
-            ev.set("title", &title.text());
-            let d = NaiveDate::parse_from_str(date.text().trim(), "%Y-%m-%d").unwrap_or(start.date());
-            if whole.is_active() {
-                ev.set("start", &When::Day(d).format());
-                ev.set("end", "");
-            } else {
-                let t = |s: &str, dflt: (u32, u32)| s.trim().split_once(':').and_then(|(h, m)| Some((h.parse().ok()?, m.parse().ok()?))).unwrap_or(dflt);
-                let (h1, m1) = t(&from.text(), (12, 0));
-                let (h2, m2) = t(&to.text(), (h1 + 1, m1));
-                let a = retifs_calendar_core::at(d, h1, m1);
-                let mut b = retifs_calendar_core::at(d, h2, m2);
-                if b <= a {
-                    b = retifs_calendar_core::at(d + Duration::days(1), h2, m2);
-                }
-                ev.set("start", &a.format());
-                ev.set("end", &b.format());
-            }
-            ev.set("rrule", REPEATS[repeat.selected() as usize].1);
-            ev.set("location", &location.text());
-            ev.set("note", &note.text());
-            ev.set_attendees(&picks.borrow().iter().filter(|(_, c)| c.is_active()).map(|(p, _)| (p.id.clone(), p.name.clone())).collect::<Vec<_>>());
+            let form = Form {
+                title: title.text().into(),
+                date: date.text().into(),
+                all_day: whole.is_active(),
+                from: from.text().into(),
+                until: to.text().into(),
+                repeat: repeat.selected() as usize,
+                location: location.text().into(),
+                note: note.text().into(),
+                attendees: picks.borrow().iter().filter(|(_, c)| c.is_active()).map(|(p, _)| (p.id.clone(), p.name.clone())).collect(),
+            };
+            ev.apply_form(&form, start.date());
             let (me3, dialog3, before) = (me2.clone(), dialog2.clone(), before.clone());
             bg(&me2.cal, move |c| c.save(&ev, before.as_ref()), move |r| {
                 match r {

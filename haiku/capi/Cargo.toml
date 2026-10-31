@@ -1,0 +1,16 @@
+[package]
+name = "retifs-calendar-capi"
+description = "retifs Calendar for Haiku: the shared core to C (the BeAPI front end), as JSON"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "retifs_calendar"
+crate-type = ["cdylib"]
+
+[dependencies]
+retifs-calendar-core = { path = "../../core" }
+chrono = "0.4"
+serde_json = "1"

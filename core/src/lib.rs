@@ -16,6 +16,29 @@ pub const TYPE: &str = libretifs::types::EVENT;
 /// A library's calendar settings (ADR-0024): it marks a calendar with no events yet.
 pub const SETTINGS_TYPE: &str = "retifs.calendar";
 
+/// How an event may repeat, as an editor offers it: (label, RFC 5545 rule).
+pub const REPEATS: [(&str, &str); 5] =
+    [("Never", ""), ("Every day", "FREQ=DAILY"), ("Every week", "FREQ=WEEKLY"), ("Every month", "FREQ=MONTHLY"), ("Every year", "FREQ=YEARLY")];
+
+/// An event as an editor has it, the way it was typed: put into the event
+/// with [`Event::apply_form`] (every front end the same way).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Form {
+    pub title: String,
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub all_day: bool,
+    /// `HH:MM`.
+    pub from: String,
+    pub until: String,
+    /// An index into [`REPEATS`].
+    pub repeat: usize,
+    pub location: String,
+    pub note: String,
+    /// The chosen contacts: (contact id, name).
+    pub attendees: Vec<(String, String)>,
+}
+
 /// An event: where it lives, its record (none until saved), its values.
 /// Keys this app doesn't edit (`uid`, an app's own) are kept.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -144,6 +167,45 @@ impl Event {
         for (id, name) in people {
             self.values.insert(format!("attendee:{id}"), name.clone());
         }
+    }
+
+    /// Its repetition as an index into [`REPEATS`] (a rule beyond the plain
+    /// frequencies shows as its frequency).
+    pub fn repeat_index(&self) -> usize {
+        match Rule::parse(self.get("rrule")).freq {
+            None => 0,
+            Some(Freq::Daily) => 1,
+            Some(Freq::Weekly) => 2,
+            Some(Freq::Monthly) => 3,
+            Some(Freq::Yearly) => 4,
+        }
+    }
+
+    /// The editor's values put into the event. A date that doesn't parse
+    /// keeps `fallback`; times that don't, 12:00 and an hour later; an end
+    /// not after the start is the next day's (a night out).
+    pub fn apply_form(&mut self, f: &Form, fallback: NaiveDate) {
+        self.set("title", &f.title);
+        let d = NaiveDate::parse_from_str(f.date.trim(), "%Y-%m-%d").unwrap_or(fallback);
+        if f.all_day {
+            self.set("start", &When::Day(d).format());
+            self.set("end", "");
+        } else {
+            let t = |s: &str, dflt: (u32, u32)| s.trim().split_once(':').and_then(|(h, m)| Some((h.parse().ok()?, m.parse().ok()?))).unwrap_or(dflt);
+            let (h1, m1) = t(&f.from, (12, 0));
+            let (h2, m2) = t(&f.until, (h1 + 1, m1));
+            let a = at(d, h1, m1);
+            let mut b = at(d, h2, m2);
+            if b <= a {
+                b = at(d + Duration::days(1), h2, m2);
+            }
+            self.set("start", &a.format());
+            self.set("end", &b.format());
+        }
+        self.set("rrule", REPEATS.get(f.repeat).map_or("", |r| r.1));
+        self.set("location", &f.location);
+        self.set("note", &f.note);
+        self.set_attendees(&f.attendees);
     }
 
     /// Its start in every repetition (or once) that falls in `from..to`
@@ -558,5 +620,29 @@ mod tests {
         let mut list = [When::parse("2026-10-25T17:00").unwrap(), When::parse("2026-10-28").unwrap(), When::parse("2026-10-25").unwrap()];
         list.sort_by_key(|w| w.sort_key());
         assert_eq!(list.map(|w| w.format()), ["2026-10-25", "2026-10-25T17:00", "2026-10-28"]);
+    }
+
+    #[test]
+    fn form_into_event() {
+        let fallback = d(2026, 11, 2);
+        let mut e = Event::new(ME);
+        let f = Form {
+            title: "Sauna".into(),
+            date: "2026-11-06".into(),
+            from: "22:00".into(),
+            until: "01:30".into(),
+            repeat: 2,
+            location: "Tartu".into(),
+            attendees: vec![("c1".into(), "Mari".into())],
+            ..Default::default()
+        };
+        e.apply_form(&f, fallback);
+        assert_eq!((e.get("start"), e.get("end"), e.get("rrule")), ("2026-11-06T22:00", "2026-11-07T01:30", "FREQ=WEEKLY"));
+        assert_eq!(e.attendees(), vec![("c1".to_string(), "Mari".to_string())]);
+        assert_eq!(e.repeat_index(), 2);
+        // All day, and a date that doesn't parse: the fallback day, no end.
+        e.apply_form(&Form { title: "Trip".into(), date: "soon".into(), all_day: true, ..Default::default() }, fallback);
+        assert_eq!((e.get("start"), e.get("end"), e.get("location"), e.repeat_index()), ("2026-11-02", "", "", 0));
+        assert!(e.attendees().is_empty());
     }
 }

@@ -1,0 +1,17 @@
+/*
+ * retifs Calendar for Haiku: the app's resources.
+ */
+
+resource app_signature "application/x-vnd.retifs-calendar";
+
+resource app_flags B_SINGLE_LAUNCH;
+
+resource app_version {
+	major  = 0,
+	middle = 0,
+	minor  = 1,
+	variety = B_APPV_DEVELOPMENT,
+	internal = 0,
+	short_info = "Calendar",
+	long_info = "retifs Calendar: calendars and events on retifs"
+};
