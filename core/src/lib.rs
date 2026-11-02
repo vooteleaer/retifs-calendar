@@ -504,7 +504,7 @@ impl Calendar {
     /// read and write it, as a member (a colleague joining the work calendar).
     pub fn invite_link(&self, ns: &str) -> Result<String, String> {
         let mut c = self.client()?;
-        let req = Request::InviteCreate { ns: ns.into(), grant: false, keys: vec![], until: None, expires_ms: Some(7 * 86_400_000), q: None, label: Some(ns.into()) };
+        let req = Request::InviteCreate { ns: ns.into(), read: false, grant: false, keys: vec![], until: None, expires_ms: Some(7 * 86_400_000), q: None, label: Some(ns.into()) };
         match self.call(&mut c, req)? {
             Response::Link { link } => Ok(link),
             other => Err(format!("unexpected answer: {other:?}")),
