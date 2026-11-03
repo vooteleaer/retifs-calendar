@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar
+GenericName=Calendar
+Comment=Calendars in retifs libraries, shared with whoever you invite
+Exec=retifs-calendar
+Icon=org.retifs.Calendar
+Terminal=false
+Categories=Office;Calendar;
+Keywords=calendar;events;retifs;
+StartupNotify=true
