@@ -401,6 +401,21 @@ impl Calendar {
         Ok(names)
     }
 
+    /// The events of library `ns` as they are (a repeating one once, with its
+    /// rule): what a system calendar a sync adapter keeps takes.
+    pub fn events(&self, ns: &str) -> Result<Vec<Event>, String> {
+        let mut c = self.client()?;
+        Ok(libretifs::types::terms(TYPE).into_iter().flat_map(|t| self.query(&mut c, ns, vec![t])).map(|r| Event::from_record(ns, &r)).collect())
+    }
+
+    /// Library `ns`'s colour as a calendar (its `retifs.calendar` record), if it has one.
+    pub fn color(&self, ns: &str) -> Option<String> {
+        let mut c = self.client().ok()?;
+        self.query(&mut c, ns, vec![format!("type={SETTINGS_TYPE}")]).iter().find_map(|r| {
+            r.attrs.iter().find(|(k, _)| k == "color").and_then(|(_, v)| if let AttrValue::Str(s) = v { Some(s.clone()) } else { None })
+        })
+    }
+
     /// The events and birthdays in `libraries` from `from` until `to` (exclusive), by start.
     pub fn occurrences(&self, libraries: &[String], from: NaiveDate, to: NaiveDate, birthdays: bool) -> Result<Vec<Occurrence>, String> {
         let mut c = self.client()?;
