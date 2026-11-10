@@ -39,6 +39,9 @@ char* rc_share_event(const char* event_json);
 
 /* {ns: count}: reload when these differ */
 char* rc_change_counts(const char* libraries_json);
+/* {"changed": bool, "known": {ns: count}}: waits up to timeout_ms for one of
+ * the libraries in known_json ({ns: count}) to change. Blocks that long. */
+char* rc_wait_change(const char* known_json, int timeout_ms);
 
 void rc_free(char* s);
 

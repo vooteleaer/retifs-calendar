@@ -6,7 +6,7 @@
 //!
 //! An event as JSON: `{"ns": "me", "id": "…" | null, "values": {"title": …}}`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_int};
 
 use chrono::{Duration, NaiveDate};
@@ -245,6 +245,22 @@ pub unsafe extern "C" fn rc_share_event(event: *const c_char) -> *mut c_char {
 pub unsafe extern "C" fn rc_change_counts(libraries: *const c_char) -> *mut c_char {
     let libs = strings(&unsafe { arg(libraries) });
     out(json!(Calendar::new().change_counts(&libs)))
+}
+
+/// Waits until one of the libraries in `known` (`{ns: count}`, the counts
+/// as last loaded) changes, for at most `timeout_ms`: `{"changed", "known"}`,
+/// the counts brought up to date. Blocks that long, so it is called from a
+/// thread of its own, which is answered the moment retifsd sees a change.
+///
+/// # Safety
+/// `known` is a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rc_wait_change(known: *const c_char, timeout_ms: c_int) -> *mut c_char {
+    let given: HashMap<String, Value> = serde_json::from_str(&unsafe { arg(known) }).unwrap_or_default();
+    // Counts through BJson come as doubles: whole numbers either way.
+    let mut known: HashMap<String, u64> = given.into_iter().filter_map(|(ns, n)| Some((ns, n.as_u64().or_else(|| n.as_f64().map(|f| f as u64))?))).collect();
+    let changed = Calendar::new().wait_change(&mut known, std::time::Duration::from_millis(timeout_ms.max(0) as u64));
+    out(json!({ "changed": changed, "known": known }))
 }
 
 /// Frees a string this library returned.

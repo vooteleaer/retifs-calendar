@@ -7,7 +7,9 @@
  *
  * Everything comes from the shared Rust core through retifs_calendar.h, as
  * JSON, read into BMessages with BJson. The core's calls block, so they run
- * in a looper of their own (Worker), which answers whoever asked.
+ * in a looper of their own (Worker), which answers whoever asked; waiting for
+ * a shown library to change has one more (Watcher), so the calls don't queue
+ * behind a wait.
  */
 
 #include <Alert.h>
@@ -22,7 +24,6 @@
 #include <ListView.h>
 #include <MenuField.h>
 #include <MenuItem.h>
-#include <MessageRunner.h>
 #include <PopUpMenu.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
@@ -56,7 +57,8 @@ enum {
 	kNextMonth = 'next',
 	kToday = 'tody',
 	kShown = 'shwn',		// a calendar or birthdays switched on or off
-	kCheck = 'chck',		// time to see whether the libraries changed
+	kWatch = 'wtch',		// watcher: wait for one of "known" to change
+	kWatched = 'wtcd',		// it did ("changed"), or the wait ran out
 	kNewEvent = 'newe',
 	kOpenDay = 'opnd',
 	kOpenComing = 'opnc',
@@ -84,15 +86,13 @@ static const char* kWeekdays[] = { "Monday", "Tuesday", "Wednesday",
 // #pragma mark - JSON helpers
 
 
-/*! Parses a string the core returned (and frees it), keeping the text too. */
+/*! Parses a string the core returned (and frees it). */
 static BMessage
-Take(char* json, BString* raw = NULL)
+Take(char* json)
 {
 	BMessage m;
 	if (json != NULL) {
 		BJson::Parse(json, m);
-		if (raw != NULL)
-			raw->SetTo(json);
 		rc_free(json);
 	}
 	return m;
@@ -205,14 +205,13 @@ public:
 		const char* b = message->GetString("b", "");
 		const char* c = message->GetString("c", "");
 		int32 n = message->GetInt32("n", 0);
-		BString raw;
 		BMessage result;
 		if (op == "libraries")
 			result = Take(rc_libraries());
 		else if (op == "load")
 			result = Take(rc_occurrences(a, b, c, n));
 		else if (op == "counts")
-			result = Take(rc_change_counts(a), &raw);
+			result = Take(rc_change_counts(a));
 		else if (op == "people")
 			result = Take(rc_people(a));
 		else if (op == "form")
@@ -233,7 +232,6 @@ public:
 		BMessage answer(kAnswer);
 		answer.AddString("op", op);
 		answer.AddMessage("result", &result);
-		answer.AddString("raw", raw);
 		// What the asker needs to know which answer this is.
 		BMessage context;
 		if (message->FindMessage("context", &context) == B_OK)
@@ -263,6 +261,35 @@ Call(BHandler* replyTo, const char* op, const char* a = "", const char* b = "",
 		call.AddMessage("context", context);
 	sWorker->PostMessage(&call);
 }
+
+
+/*! Waits for a shown library to change (rc_wait_change, a minute at most)
+	and answers whoever asked with kWatched; asked again for the next wait. */
+class Watcher : public BLooper {
+public:
+	Watcher() : BLooper("calendar watcher") {}
+
+	void MessageReceived(BMessage* message)
+	{
+		if (message->what != kWatch) {
+			BLooper::MessageReceived(message);
+			return;
+		}
+		BMessage result = Take(rc_wait_change(message->GetString("known", "{}"),
+			60000));
+		BMessage known;
+		result.FindMessage("known", &known);
+		BMessage answer(kWatched);
+		answer.AddBool("changed", result.GetBool("changed", false));
+		answer.AddMessage("known", &known);
+		BMessenger replyTo;
+		if (message->FindMessenger("reply_to", &replyTo) == B_OK)
+			replyTo.SendMessage(&answer);
+	}
+};
+
+
+static Watcher* sWatcher = NULL;
 
 
 // #pragma mark - LinkWindow
@@ -736,12 +763,7 @@ public:
 
 		_UpdateTitles();
 		Call(this, "libraries");
-		fRunner = new BMessageRunner(BMessenger(this), BMessage(kCheck), 3000000);
-	}
-
-	~CalendarWindow()
-	{
-		delete fRunner;
+		_Watch();
 	}
 
 	void MessageReceived(BMessage* message)
@@ -773,8 +795,12 @@ public:
 				fMonth->SetDate(BDate::CurrentDate(B_LOCAL_TIME));
 				_Reload();
 				break;
-			case kCheck:
-				Call(this, "counts", JsonArray(_Shown()).String());
+			case kWatched:
+				if (message->GetBool("changed", false))
+					_Reload();
+				fKnown.MakeEmpty();
+				message->FindMessage("known", &fKnown);
+				_Watch();
 				break;
 			case kNewEvent:
 			{
@@ -861,12 +887,31 @@ private:
 				return;
 			fOccurrences = r;
 			_ShowDay();
-		} else if (op == "counts") {
-			BString raw = message->GetString("raw", "");
-			if (!fCounts.IsEmpty() && raw != fCounts)
-				_Reload();
-			fCounts = raw;
+		} else if (op == "counts")
+			fCounts = r;
+	}
+
+	/*! Asks the watcher to wait for one of the libraries shown now to change:
+		their counts as last waited for, a newly shown one's from the last load. */
+	void _Watch()
+	{
+		BStringList shown = _Shown();
+		BString known("{");
+		for (int32 i = 0; i < shown.CountStrings(); i++) {
+			BString ns = shown.StringAt(i);
+			double count;
+			if (fKnown.FindDouble(ns.String(), &count) != B_OK
+				&& fCounts.FindDouble(ns.String(), &count) != B_OK)
+				continue;
+			if (known.Length() > 1)
+				known << ",";
+			known << JsonString(ns.String()) << ":" << (uint64)count;
 		}
+		known << "}";
+		BMessage watch(kWatch);
+		watch.AddString("known", known);
+		watch.AddMessenger("reply_to", BMessenger(this));
+		sWatcher->PostMessage(&watch);
 	}
 
 	BStringList _Shown()
@@ -904,6 +949,8 @@ private:
 		twoWeeks.AddDays(15);
 		if (twoWeeks > until)
 			until = twoWeeks;
+		// The counts first: a change while loading is then still seen.
+		Call(this, "counts", JsonArray(_Shown()).String());
 		BMessage context;
 		context.AddInt32("generation", ++fGeneration);
 		Call(this, "load", JsonArray(_Shown()).String(),
@@ -982,9 +1029,9 @@ private:
 	std::vector<int32> fComingRows;
 	BStringList fLibraries;
 	BMessage fOccurrences;
-	BString fCounts;
+	BMessage fCounts;		// {ns: count} as of the last load
+	BMessage fKnown;		// {ns: count} as the watcher last saw them
 	int32 fGeneration = 0;
-	BMessageRunner* fRunner;
 };
 
 
@@ -999,6 +1046,8 @@ public:
 	{
 		sWorker = new Worker();
 		sWorker->Run();
+		sWatcher = new Watcher();
+		sWatcher->Run();
 		(new CalendarWindow())->Show();
 	}
 
@@ -1007,6 +1056,8 @@ public:
 		if (sWorker != NULL && sWorker->Lock())
 			sWorker->Quit();
 		sWorker = NULL;
+		// The watcher isn't locked to quit: it may be a minute into a wait.
+		// It goes with the app.
 		return true;
 	}
 };

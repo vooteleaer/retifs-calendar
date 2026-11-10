@@ -153,13 +153,7 @@ fn build(gapp: &adw::Application) {
         set_libraries(&me2, r.unwrap_or_else(|_| vec![ME.into()]));
         reload(&me2);
     });
-    {
-        let me = me.clone();
-        glib::timeout_add_seconds_local(3, move || {
-            refresh_if_changed(&me);
-            glib::ControlFlow::Continue
-        });
-    }
+    watch_changes(&me, Arc::new(Calendar::new()), HashMap::new());
     snapshot_on_request(&window);
     window.present();
 }
@@ -221,13 +215,27 @@ fn reload(me: &Rc<App>) {
     });
 }
 
-fn refresh_if_changed(me: &Rc<App>) {
+/// Reloads when a library shown changes: retifsd says so the moment it
+/// does (`Calendar::wait_change`), waited for on a `Calendar` of its own so
+/// nothing else is held up meanwhile.
+fn watch_changes(me: &Rc<App>, watcher: Arc<Calendar>, mut known: HashMap<String, u64>) {
+    // The libraries shown now, a newly shown one from the count of the last load.
     let libs = me.shown_libraries();
-    let me2 = me.clone();
-    bg(&me.cal, move |c| c.change_counts(&libs), move |counts| {
-        if !counts.is_empty() && counts != *me2.counts.borrow() {
+    known.retain(|ns, _| libs.contains(ns));
+    for (ns, n) in me.counts.borrow().iter() {
+        if libs.contains(ns) {
+            known.entry(ns.clone()).or_insert(*n);
+        }
+    }
+    let (me2, w) = (me.clone(), watcher.clone());
+    bg(&watcher, move |c| {
+        let changed = c.wait_change(&mut known, std::time::Duration::from_secs(60));
+        (changed, known)
+    }, move |(changed, known)| {
+        if changed {
             reload(&me2);
         }
+        watch_changes(&me2, w, known);
     });
 }
 
