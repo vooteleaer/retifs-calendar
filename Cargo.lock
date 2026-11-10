@@ -537,7 +537,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libretifs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rmp-serde",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-calendar-capi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "retifs-calendar-core",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-calendar-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "libretifs",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-calendar-gtk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "gtk4",
