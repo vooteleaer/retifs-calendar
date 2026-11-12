@@ -501,7 +501,7 @@ impl Calendar {
         self.call(&mut c, Request::RecordDelete { ns: e.ns.clone(), id: id.clone() }).map(|_| ())
     }
 
-    /// A `retifs:` link to read namespace `ns` (a calendar, or a share made from one).
+    /// A `retifs:` link to read library `ns` (a calendar, or a share made from one).
     fn read_link(&self, c: &mut Client, ns: &str, label: &str) -> Result<String, String> {
         let address = match self.call(c, Request::NsAddress { ns: ns.into() })? {
             Response::Channel { address } => address,
